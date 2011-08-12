@@ -10,7 +10,6 @@
                         (food :noun)
                         (dog :noun)))
 
-(defparameter *word-types* '(:pronoun :verb :article :noun))
 (defparameter *clause-types* '((:s :np :vp)
                                (:np :pronoun)
                                (:np :article :noun)
@@ -19,182 +18,64 @@
 
 (defvar *source-sentence*)
 
-;; Evolve
-
-(defun evolve (&key (pop-size 1000)
-               (pop (rand-pop pop-size))
-               (gens 100)
-               (elitism 750)
-               (genesis 100))
-  (if (zerop gens)
-      (values pop (mapcar 'score-clause pop))
-      (let* ((elite (remove-duplicates                        ; slow?
-                     (subseq (sort pop '< :key 'score-clause) ; memoize score-clause
-                             (- pop-size elitism))
-                     :test 'equal))
-             (clauses-indexed (clauses-indexed pop))
-             (new (rand-pop genesis clauses-indexed)))
-        (evolve :pop-size pop-size
-                :pop (append new
-                             (loop for i from 1 to
-                                  (- pop-size (length elite) genesis)
-                                collect
-                                  (let ((parent (rand-elt pop)))
-                                    (if (or (= (random 2) 1)
-                                            (find (first parent)
-                                                  *word-types*))
-                                        (mutate-clause clauses-indexed
-                                                       parent)
-                                        (rand-elt (cddr parent)))))
-                             elite)
-                :gens (- gens 1)
-                :elitism elitism))))
-
-;; Gen
-
-(defun rand-pop (size &optional (clauses (make-hash-table)))
-  (if (zerop size)
-      nil
-      (cons (rand-clause clauses)
-            (rand-pop (- size 1)))))
-
 (defun rand-elt (seq)
   (elt seq (random (length seq))))
 
-(defun clauses-indexed (clauses)
-  (let ((ht (make-hash-table)))
-    (dolist (clause clauses)
-      (push clause (gethash (first clause) ht)))
-    (let ((ht2 (make-hash-table)))
-      (maphash (lambda (type clauses)
-                 (setf (gethash type ht2)
-                       (coerce clauses 'vector)))
-               ht)
-      ht2)))
+(defun candidate-word-clauses (word)
+  (mapcar 'reverse
+	  (remove word *words* :key 'first :test-not 'eq)))
 
-(defun rand-clause (&optional clauses
-                    (type
-                     (rand-elt
-                      (append *word-types*
-                              (remove-duplicates
-                               (mapcar 'first *clause-types*))))))
-  (let ((candidate-clauses (if (= (random 2) 0)
-                               (gethash type clauses)
-                               #())))
-    (if (not (zerop (length candidate-clauses)))
-        (rand-elt candidate-clauses)
-        (if (find type *word-types*)
-            (rand-word type)
-            (let* ((schemas (remove type *clause-types*
-                                    :test-not 'eq
-                                    :key 'first))
-                   (schema (rand-elt schemas)))
-              (list* (first schema)
-                     (rand-range *source-sentence*)
-                     (mapcar (lambda (type)
-                               (rand-clause clauses type))
-                             (rest schema))))))))
+(defun initial-clauses ()
+  (mapcar 'candidate-word-clauses *source-sentence*))
 
-(defun rand-range (seq)
-  (let ((start (random (+ (length seq) 1))))
-    (list start (+ start
-                   (random (+ (- (length seq) start) 1))))))
+(defun initial-bag ()
+  (let ((clauses (initial-clauses)))
+    (list :starts (coerce (append clauses '(())) 'vector)
+	  :ends (coerce (cons () clauses) 'vector))))
 
-(defun rand-word (type)
-  (list type
-        (let ((start (random (length *source-sentence*))))
-          (list start (1+ start)))
-        (first (rand-elt *words*))))
+(defun word-length (clause)
+  (if (symbolp clause)
+      1
+      (reduce '+ (rest clause) :key 'word-length)))
 
-;; Mutate
+(defun create-string (bag start-index subschema)
+  (cond ((null subschema) (values nil t))
+	((>= start-index (length (getf bag :starts))) (values nil nil))
+	(t
+	 (let ((candidates
+		(remove (first subschema) (elt (getf bag :starts) start-index)
+			:key 'first :test-not 'eq)))
+	   (if candidates
+	       (let* ((first (rand-elt candidates))
+		      (next-start-index (+ start-index (word-length first))))
+		 (multiple-value-bind (rest success)
+		     (create-string bag next-start-index (rest subschema))
+		   (if success
+		       (values (cons first rest) t)
+		       (values nil nil))))
+	       (values nil nil))))))
 
-(defun mutate-clause (clauses clause)
-  (let ((mutated (%mutate-clause% clauses clause)))
-    (if (= (random 2) 0)
-        mutated
-        (mutate-clause clauses mutated))))
+(defun try-add-clause (bag)
+  (let ((start-index (random (length (getf bag :starts))))
+	(schema (rand-elt *clause-types*)))
+    (multiple-value-bind (string success)
+	(create-string bag start-index (rest schema))
+      (if (and success
+	       (not (find (cons (first schema) string)
+			  (elt (getf bag :starts) start-index)
+			  :test 'equal)))
+	  (let ((clause (cons (first schema) string))
+		(bag (list :starts (copy-seq (getf bag :starts))
+			   :ends (copy-seq (getf bag :ends)))))
+	    (push clause (elt (getf bag :starts) start-index))
+	    (push clause (elt (getf bag :ends) (+ start-index
+						  (word-length clause))))
+	    (values bag t))
+	  (values bag nil)))))
 
-(defun %mutate-clause% (clauses clause)
-  (destructuring-bind (type range &rest subclauses) clause
-    (case (random 2)
-      (0 (list* type (mutate-range range) subclauses))
-      (1 (list* type range
-                (mutate-subclauses clauses subclauses))))))
-
-(defun mutate-subclauses (clauses subclauses)
-  (let ((mutating-index (random (length subclauses))))
-    (append (subseq subclauses 0 mutating-index)
-            (list (mutate-subclause clauses
-                                    (elt subclauses mutating-index)))
-            (subseq subclauses (+ mutating-index 1)))))
-
-(defun mutate-subclause (clauses subclause)
-  (if (symbolp subclause)
-      (first (rand-elt *words*))
-      (if (= (random 2) 0)
-          (rand-clause clauses (first subclause))
-          (mutate-clause clauses subclause))))
-
-(defun mutate-range (range)
-  (destructuring-bind (start end) range
-    (case (random 4)
-      (0 (list (max (- start 1) 0) end))
-      (1 (list (min (+ start 1) end) end))
-      (2 (list start (max (- end 1) start)))
-      (3 (list start (min (+ end 1) (length *source-sentence*)))))))
-
-;; Score
-
-(defun score-clause (clause)            ; memoize
-  (if (find (first clause) *word-types*)
-      (score-word clause)
-      (score-complex-clause clause)))
-
-(defun score-word (clause)
-  (destructuring-bind (type (start end) word) clause
-    (+
-     ;; present in source-sentence's range
-     (if (find word (subseq *source-sentence* start end))
-         1 -9)
-     ;; range <= 1 char
-     (if (>= start (- end 1))
-         0 -1)
-     ;; word exists
-     (if (find word *words* :key 'first)
-         4 0)
-     ;; correct part-of-speech
-     (if (find (list word type) *words* :test 'equal)
-         4 0))))
-
-(defun score-complex-clause (clause)
-  (destructuring-bind (type range &rest subclauses) clause
-    (if (null subclauses)
-        0
-        (let ((sub (first subclauses)))
-          (+
-           ;; subclause score
-           (score-clause sub)
-           ;; range starts as late as possible
-           (if (= (apply 'min (mapcar 'first (mapcar 'second
-                                                     subclauses)))
-                  (first range))
-               0 -1)
-           ;; range ends as soon as possible
-           (if (= (apply 'max (mapcar 'second (mapcar 'second
-                                                      subclauses)))
-                  (second range))
-               0 -1)
-           ;; range contains subclause
-           (if (contains-range-p range (second sub))
-               0 -6)
-           ;; recursive
-           (score-complex-clause (list* type
-                                        (list (second (second sub))
-                                              (second range))
-                                        (rest subclauses))))))))
-
-(defun contains-range-p (range1 range2)
-  (<= (first range1)
-      (first range2)
-      (second range2)
-      (second range1)))
+(defun try-add-clauses (bag n &optional (num-added 0))
+  (if (zerop n)
+      (values bag num-added)
+      (multiple-value-bind (bag success)
+	  (try-add-clause bag)
+	(try-add-clauses bag (1- n) (+ num-added (if success 1 0))))))
